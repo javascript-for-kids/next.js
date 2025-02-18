@@ -1,10 +1,13 @@
-import type { FlightRouterState } from '../app-render/types'
-
 import { getTracer } from '../lib/trace/tracer'
 import { AppRenderSpan } from '../lib/trace/constants'
-import { createDecodeTransformStream } from './encode-decode'
 import { DetachedPromise } from '../../lib/detached-promise'
 import { scheduleImmediate, atLeastOneTask } from '../../lib/scheduler'
+import { ENCODED_TAGS } from './encodedTags'
+import {
+  indexOfUint8Array,
+  isEquivalentUint8Arrays,
+  removeFromUint8Array,
+} from './uint8array-helpers'
 
 function voidCatch() {
   // this catcher is designed to be used with pipeTo where we expect the underlying
@@ -70,23 +73,51 @@ export function streamFromString(str: string): ReadableStream<Uint8Array> {
   })
 }
 
-export async function streamToString(
+export function streamFromBuffer(chunk: Buffer): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(chunk)
+      controller.close()
+    },
+  })
+}
+
+export async function streamToBuffer(
   stream: ReadableStream<Uint8Array>
+): Promise<Buffer> {
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) {
+      break
+    }
+
+    chunks.push(value)
+  }
+
+  return Buffer.concat(chunks)
+}
+
+export async function streamToString(
+  stream: ReadableStream<Uint8Array>,
+  signal?: AbortSignal
 ): Promise<string> {
-  let buffer = ''
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  let string = ''
 
-  await stream
-    // Decode the streamed chunks to turn them into strings.
-    .pipeThrough(createDecodeTransformStream())
-    .pipeTo(
-      new WritableStream<string>({
-        write(chunk) {
-          buffer += chunk
-        },
-      })
-    )
+  for await (const chunk of stream) {
+    if (signal?.aborted) {
+      return string
+    }
 
-  return buffer
+    string += decoder.decode(chunk, { stream: true })
+  }
+
+  string += decoder.decode()
+
+  return string
 }
 
 export function createBufferedTransformStream(): TransformStream<
@@ -108,6 +139,7 @@ export function createBufferedTransformStream(): TransformStream<
       try {
         const chunk = new Uint8Array(bufferByteLength)
         let copiedBytes = 0
+
         for (let i = 0; i < bufferedChunks.length; i++) {
           const bufferedChunk = bufferedChunks[i]
           chunk.set(bufferedChunk, copiedBytes)
@@ -146,21 +178,6 @@ export function createBufferedTransformStream(): TransformStream<
   })
 }
 
-function createInsertedHTMLStream(
-  getServerInsertedHTML: () => Promise<string>
-): TransformStream<Uint8Array, Uint8Array> {
-  return new TransformStream({
-    transform: async (chunk, controller) => {
-      const html = await getServerInsertedHTML()
-      if (html) {
-        controller.enqueue(encoder.encode(html))
-      }
-
-      controller.enqueue(chunk)
-    },
-  })
-}
-
 export function renderToInitialFizzStream({
   ReactDOMServer,
   element,
@@ -168,7 +185,7 @@ export function renderToInitialFizzStream({
 }: {
   ReactDOMServer: typeof import('react-dom/server.edge')
   element: React.ReactElement
-  streamOptions?: any
+  streamOptions?: Parameters<typeof ReactDOMServer.renderToReadableStream>[1]
 }): Promise<ReactReadableStream> {
   return getTracer().trace(AppRenderSpan.renderToReadableStream, async () =>
     ReactDOMServer.renderToReadableStream(element, streamOptions)
@@ -179,9 +196,6 @@ function createHeadInsertionTransformStream(
   insert: () => Promise<string>
 ): TransformStream<Uint8Array, Uint8Array> {
   let inserted = false
-  let freezing = false
-
-  const decoder = new TextDecoder()
 
   // We need to track if this transform saw any bytes because if it didn't
   // we won't want to insert any server HTML at all
@@ -190,35 +204,57 @@ function createHeadInsertionTransformStream(
   return new TransformStream({
     async transform(chunk, controller) {
       hasBytes = true
-      // While react is flushing chunks, we don't apply insertions
-      if (freezing) {
-        controller.enqueue(chunk)
-        return
-      }
 
       const insertion = await insert()
       if (inserted) {
-        controller.enqueue(encoder.encode(insertion))
+        if (insertion) {
+          const encodedInsertion = encoder.encode(insertion)
+          controller.enqueue(encodedInsertion)
+        }
         controller.enqueue(chunk)
-        freezing = true
       } else {
-        const content = decoder.decode(chunk)
-        const index = content.indexOf('</head>')
+        // TODO (@Ethan-Arrowood): Replace the generic `indexOfUint8Array` method with something finely tuned for the subset of things actually being checked for.
+        const index = indexOfUint8Array(chunk, ENCODED_TAGS.CLOSED.HEAD)
+        // In fully static rendering or non PPR rendering cases:
+        // `/head>` will always be found in the chunk in first chunk rendering.
         if (index !== -1) {
-          const insertedHeadContent =
-            content.slice(0, index) + insertion + content.slice(index)
-          controller.enqueue(encoder.encode(insertedHeadContent))
-          freezing = true
+          if (insertion) {
+            const encodedInsertion = encoder.encode(insertion)
+            // Get the total count of the bytes in the chunk and the insertion
+            // e.g.
+            // chunk = <head><meta charset="utf-8"></head>
+            // insertion = <script>...</script>
+            // output = <head><meta charset="utf-8"> [ <script>...</script> ] </head>
+            const insertedHeadContent = new Uint8Array(
+              chunk.length + encodedInsertion.length
+            )
+            // Append the first part of the chunk, before the head tag
+            insertedHeadContent.set(chunk.slice(0, index))
+            // Append the server inserted content
+            insertedHeadContent.set(encodedInsertion, index)
+            // Append the rest of the chunk
+            insertedHeadContent.set(
+              chunk.slice(index),
+              index + encodedInsertion.length
+            )
+            controller.enqueue(insertedHeadContent)
+          } else {
+            controller.enqueue(chunk)
+          }
+          inserted = true
+        } else {
+          // This will happens in PPR rendering during next start, when the page is partially rendered.
+          // When the page resumes, the head tag will be found in the middle of the chunk.
+          // Where we just need to append the insertion and chunk to the current stream.
+          // e.g.
+          // PPR-static: <head>...</head><body> [ resume content ] </body>
+          // PPR-resume: [ insertion ] [ rest content ]
+          if (insertion) {
+            controller.enqueue(encoder.encode(insertion))
+          }
+          controller.enqueue(chunk)
           inserted = true
         }
-      }
-
-      if (!inserted) {
-        controller.enqueue(chunk)
-      } else {
-        scheduleImmediate(() => {
-          freezing = false
-        })
       }
     },
     async flush(controller) {
@@ -340,17 +376,15 @@ function createMergedTransformStream(
   })
 }
 
+const CLOSE_TAG = '</body></html>'
+
 /**
  * This transform stream moves the suffix to the end of the stream, so results
  * like `</body></html><script>...</script>` will be transformed to
  * `<script>...</script></body></html>`.
  */
-function createMoveSuffixStream(
-  suffix: string
-): TransformStream<Uint8Array, Uint8Array> {
+function createMoveSuffixStream(): TransformStream<Uint8Array, Uint8Array> {
   let foundSuffix = false
-
-  const decoder = new TextDecoder()
 
   return new TransformStream({
     transform(chunk, controller) {
@@ -358,29 +392,28 @@ function createMoveSuffixStream(
         return controller.enqueue(chunk)
       }
 
-      const buf = decoder.decode(chunk)
-      const index = buf.indexOf(suffix)
+      const index = indexOfUint8Array(chunk, ENCODED_TAGS.CLOSED.BODY_AND_HTML)
       if (index > -1) {
         foundSuffix = true
 
         // If the whole chunk is the suffix, then don't write anything, it will
         // be written in the flush.
-        if (buf.length === suffix.length) {
+        if (chunk.length === ENCODED_TAGS.CLOSED.BODY_AND_HTML.length) {
           return
         }
 
         // Write out the part before the suffix.
-        const before = buf.slice(0, index)
-        chunk = encoder.encode(before)
-        controller.enqueue(chunk)
+        const before = chunk.slice(0, index)
+        controller.enqueue(before)
 
         // In the case where the suffix is in the middle of the chunk, we need
         // to split the chunk into two parts.
-        if (buf.length > suffix.length + index) {
+        if (chunk.length > ENCODED_TAGS.CLOSED.BODY_AND_HTML.length + index) {
           // Write out the part after the suffix.
-          const after = buf.slice(index + suffix.length)
-          chunk = encoder.encode(after)
-          controller.enqueue(chunk)
+          const after = chunk.slice(
+            index + ENCODED_TAGS.CLOSED.BODY_AND_HTML.length
+          )
+          controller.enqueue(after)
         }
       } else {
         controller.enqueue(chunk)
@@ -389,7 +422,7 @@ function createMoveSuffixStream(
     flush(controller) {
       // Even if we didn't find the suffix, the HTML is not valid if we don't
       // add it, so insert it at the end.
-      controller.enqueue(encoder.encode(suffix))
+      controller.enqueue(ENCODED_TAGS.CLOSED.BODY_AND_HTML)
     },
   })
 }
@@ -398,7 +431,6 @@ function createStripDocumentClosingTagsTransform(): TransformStream<
   Uint8Array,
   Uint8Array
 > {
-  const decoder = new TextDecoder()
   return new TransformStream({
     transform(chunk, controller) {
       // We rely on the assumption that chunks will never break across a code unit.
@@ -406,82 +438,70 @@ function createStripDocumentClosingTagsTransform(): TransformStream<
       // flush into one chunk before streaming it forward which means the chunk will represent
       // a single coherent utf-8 string. This is not safe to use if we change our streaming to no
       // longer do this large buffered chunk
-      let originalContent = decoder.decode(chunk)
-      let content = originalContent
-
       if (
-        content === '</body></html>' ||
-        content === '</body>' ||
-        content === '</html>'
+        isEquivalentUint8Arrays(chunk, ENCODED_TAGS.CLOSED.BODY_AND_HTML) ||
+        isEquivalentUint8Arrays(chunk, ENCODED_TAGS.CLOSED.BODY) ||
+        isEquivalentUint8Arrays(chunk, ENCODED_TAGS.CLOSED.HTML)
       ) {
-        // the entire chunk is the closing tags.
+        // the entire chunk is the closing tags; return without enqueueing anything.
         return
-      } else {
-        // We assume these tags will go at together at the end of the document and that
-        // they won't appear anywhere else in the document. This is not really a safe assumption
-        // but until we revamp our streaming infra this is a performant way to string the tags
-        content = content.replace('</body>', '').replace('</html>', '')
-        if (content.length !== originalContent.length) {
-          return controller.enqueue(encoder.encode(content))
-        }
       }
+
+      // We assume these tags will go at together at the end of the document and that
+      // they won't appear anywhere else in the document. This is not really a safe assumption
+      // but until we revamp our streaming infra this is a performant way to string the tags
+      chunk = removeFromUint8Array(chunk, ENCODED_TAGS.CLOSED.BODY)
+      chunk = removeFromUint8Array(chunk, ENCODED_TAGS.CLOSED.HTML)
 
       controller.enqueue(chunk)
     },
   })
 }
 
-export function createRootLayoutValidatorStream(
-  assetPrefix = '',
-  getTree: () => FlightRouterState
-): TransformStream<Uint8Array, Uint8Array> {
+/*
+ * Checks if the root layout is missing the html or body tags
+ * and if so, it will inject a script tag to throw an error in the browser, showing the user
+ * the error message in the error overlay.
+ */
+export function createRootLayoutValidatorStream(): TransformStream<
+  Uint8Array,
+  Uint8Array
+> {
   let foundHtml = false
   let foundBody = false
-
-  const decoder = new TextDecoder()
-
-  let content = ''
   return new TransformStream({
     async transform(chunk, controller) {
       // Peek into the streamed chunk to see if the tags are present.
-      if (!foundHtml || !foundBody) {
-        content += decoder.decode(chunk, { stream: true })
-        if (!foundHtml && content.includes('<html')) {
-          foundHtml = true
-        }
-        if (!foundBody && content.includes('<body')) {
-          foundBody = true
-        }
+      if (
+        !foundHtml &&
+        indexOfUint8Array(chunk, ENCODED_TAGS.OPENING.HTML) > -1
+      ) {
+        foundHtml = true
       }
+
+      if (
+        !foundBody &&
+        indexOfUint8Array(chunk, ENCODED_TAGS.OPENING.BODY) > -1
+      ) {
+        foundBody = true
+      }
+
       controller.enqueue(chunk)
     },
     flush(controller) {
-      // Flush the decoder.
-      if (!foundHtml || !foundBody) {
-        content += decoder.decode()
-        if (!foundHtml && content.includes('<html')) {
-          foundHtml = true
-        }
-        if (!foundBody && content.includes('<body')) {
-          foundBody = true
-        }
-      }
-
-      // If html or body tag is missing, we need to inject a script to notify
-      // the client.
-      const missingTags: string[] = []
+      const missingTags: typeof window.__next_root_layout_missing_tags = []
       if (!foundHtml) missingTags.push('html')
       if (!foundBody) missingTags.push('body')
 
-      if (missingTags.length > 0) {
-        controller.enqueue(
-          encoder.encode(
-            `<script>self.__next_root_layout_missing_tags_error=${JSON.stringify(
-              { missingTags, assetPrefix: assetPrefix ?? '', tree: getTree() }
-            )}</script>`
-          )
+      if (!missingTags.length) return
+
+      controller.enqueue(
+        encoder.encode(
+          `<script>self.__next_root_layout_missing_tags=${JSON.stringify(
+            missingTags
+          )}</script>`
         )
-      }
+      )
     },
   })
 }
@@ -502,14 +522,9 @@ function chainTransformers<T>(
 export type ContinueStreamOptions = {
   inlinedDataStream: ReadableStream<Uint8Array> | undefined
   isStaticGeneration: boolean
-  getServerInsertedHTML: (() => Promise<string>) | undefined
-  serverInsertedHTMLToHead: boolean
-  validateRootLayout:
-    | {
-        assetPrefix: string | undefined
-        getTree: () => FlightRouterState
-      }
-    | undefined
+  getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
+  validateRootLayout?: boolean
   /**
    * Suffix to inject after the buffered data, but before the close tags.
    */
@@ -523,14 +538,12 @@ export async function continueFizzStream(
     inlinedDataStream,
     isStaticGeneration,
     getServerInsertedHTML,
-    serverInsertedHTMLToHead,
+    getServerInsertedMetadata,
     validateRootLayout,
   }: ContinueStreamOptions
 ): Promise<ReadableStream<Uint8Array>> {
-  const closeTag = '</body></html>'
-
   // Suffix itself might contain close tags at the end, so we need to split it.
-  const suffixUnclosed = suffix ? suffix.split(closeTag, 1)[0] : null
+  const suffixUnclosed = suffix ? suffix.split(CLOSE_TAG, 1)[0] : null
 
   // If we're generating static HTML and there's an `allReady` promise on the
   // stream, we need to wait for it to resolve before continuing.
@@ -542,10 +555,8 @@ export async function continueFizzStream(
     // Buffer everything to avoid flushing too frequently
     createBufferedTransformStream(),
 
-    // Insert generated tags to head
-    getServerInsertedHTML && !serverInsertedHTMLToHead
-      ? createInsertedHTMLStream(getServerInsertedHTML)
-      : null,
+    // Insert generated metadata
+    createHeadInsertionTransformStream(getServerInsertedMetadata),
 
     // Insert suffix content
     suffixUnclosed != null && suffixUnclosed.length > 0
@@ -555,32 +566,30 @@ export async function continueFizzStream(
     // Insert the inlined data (Flight data, form state, etc.) stream into the HTML
     inlinedDataStream ? createMergedTransformStream(inlinedDataStream) : null,
 
+    // Validate the root layout for missing html or body tags
+    validateRootLayout ? createRootLayoutValidatorStream() : null,
+
     // Close tags should always be deferred to the end
-    createMoveSuffixStream(closeTag),
+    createMoveSuffixStream(),
 
     // Special head insertions
     // TODO-APP: Insert server side html to end of head in app layout rendering, to avoid
     // hydration errors. Remove this once it's ready to be handled by react itself.
-    getServerInsertedHTML && serverInsertedHTMLToHead
-      ? createHeadInsertionTransformStream(getServerInsertedHTML)
-      : null,
-
-    validateRootLayout
-      ? createRootLayoutValidatorStream(
-          validateRootLayout.assetPrefix,
-          validateRootLayout.getTree
-        )
-      : null,
+    createHeadInsertionTransformStream(getServerInsertedHTML),
   ])
 }
 
 type ContinueDynamicPrerenderOptions = {
   getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
 }
 
 export async function continueDynamicPrerender(
   prerenderStream: ReadableStream<Uint8Array>,
-  { getServerInsertedHTML }: ContinueDynamicPrerenderOptions
+  {
+    getServerInsertedHTML,
+    getServerInsertedMetadata,
+  }: ContinueDynamicPrerenderOptions
 ) {
   return (
     prerenderStream
@@ -589,72 +598,75 @@ export async function continueDynamicPrerender(
       .pipeThrough(createStripDocumentClosingTagsTransform())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
+      // Insert generated metadata
+      .pipeThrough(
+        createHeadInsertionTransformStream(getServerInsertedMetadata)
+      )
   )
 }
 
 type ContinueStaticPrerenderOptions = {
   inlinedDataStream: ReadableStream<Uint8Array>
   getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
 }
 
 export async function continueStaticPrerender(
   prerenderStream: ReadableStream<Uint8Array>,
-  { inlinedDataStream, getServerInsertedHTML }: ContinueStaticPrerenderOptions
+  {
+    inlinedDataStream,
+    getServerInsertedHTML,
+    getServerInsertedMetadata,
+  }: ContinueStaticPrerenderOptions
 ) {
-  const closeTag = '</body></html>'
-
   return (
     prerenderStream
       // Buffer everything to avoid flushing too frequently
       .pipeThrough(createBufferedTransformStream())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
+      // Insert generated metadata to head
+      .pipeThrough(
+        createHeadInsertionTransformStream(getServerInsertedMetadata)
+      )
       // Insert the inlined data (Flight data, form state, etc.) stream into the HTML
       .pipeThrough(createMergedTransformStream(inlinedDataStream))
       // Close tags should always be deferred to the end
-      .pipeThrough(createMoveSuffixStream(closeTag))
+      .pipeThrough(createMoveSuffixStream())
   )
 }
 
 type ContinueResumeOptions = {
   inlinedDataStream: ReadableStream<Uint8Array>
   getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
 }
 
 export async function continueDynamicHTMLResume(
   renderStream: ReadableStream<Uint8Array>,
-  { inlinedDataStream, getServerInsertedHTML }: ContinueResumeOptions
+  {
+    inlinedDataStream,
+    getServerInsertedHTML,
+    getServerInsertedMetadata,
+  }: ContinueResumeOptions
 ) {
-  const closeTag = '</body></html>'
-
   return (
     renderStream
       // Buffer everything to avoid flushing too frequently
       .pipeThrough(createBufferedTransformStream())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
+      // Insert generated metadata to body
+      .pipeThrough(
+        createHeadInsertionTransformStream(getServerInsertedMetadata)
+      )
       // Insert the inlined data (Flight data, form state, etc.) stream into the HTML
       .pipeThrough(createMergedTransformStream(inlinedDataStream))
       // Close tags should always be deferred to the end
-      .pipeThrough(createMoveSuffixStream(closeTag))
+      .pipeThrough(createMoveSuffixStream())
   )
 }
 
-type ContinueDynamicDataResumeOptions = {
-  inlinedDataStream: ReadableStream<Uint8Array>
-}
-
-export async function continueDynamicDataResume(
-  renderStream: ReadableStream<Uint8Array>,
-  { inlinedDataStream }: ContinueDynamicDataResumeOptions
-) {
-  const closeTag = '</body></html>'
-
-  return (
-    renderStream
-      // Insert the inlined data (Flight data, form state, etc.) stream into the HTML
-      .pipeThrough(createMergedTransformStream(inlinedDataStream))
-      // Close tags should always be deferred to the end
-      .pipeThrough(createMoveSuffixStream(closeTag))
-  )
+export function createDocumentClosingStream(): ReadableStream<Uint8Array> {
+  return streamFromString(CLOSE_TAG)
 }

@@ -1,12 +1,11 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, Suspense } from 'react'
 import {
   ACTION_UNHANDLED_ERROR,
   ACTION_UNHANDLED_REJECTION,
-} from '../../app/error-overlay-reducer'
-import type {
-  UnhandledErrorAction,
-  UnhandledRejectionAction,
-} from '../../app/error-overlay-reducer'
+  type UnhandledErrorAction,
+  type UnhandledRejectionAction,
+} from '../../shared'
+import type { DebugInfo } from '../../types'
 import {
   Dialog,
   DialogBody,
@@ -16,8 +15,8 @@ import {
 import { LeftRightDialogHeader } from '../components/LeftRightDialogHeader'
 import { Overlay } from '../components/Overlay'
 import { Toast } from '../components/Toast'
-import { getErrorByType } from '../helpers/getErrorByType'
-import type { ReadyRuntimeError } from '../helpers/getErrorByType'
+import { getErrorByType } from '../helpers/get-error-by-type'
+import type { ReadyRuntimeError } from '../helpers/get-error-by-type'
 import { noop as css } from '../helpers/noop-template'
 import { CloseIcon } from '../icons/CloseIcon'
 import { RuntimeError } from './RuntimeError'
@@ -25,6 +24,18 @@ import { VersionStalenessInfo } from '../components/VersionStalenessInfo'
 import type { VersionInfo } from '../../../../../server/dev/parse-version-info'
 import { getErrorSource } from '../../../../../shared/lib/error-source'
 import { HotlinkedText } from '../components/hot-linked-text'
+import { PseudoHtmlDiff } from './RuntimeError/component-stack-pseudo-html'
+import {
+  type HydrationErrorState,
+  getHydrationWarningType,
+} from '../../../errors/hydration-error-info'
+import { NodejsInspectorCopyButton } from '../components/nodejs-inspector'
+import { CopyButton } from '../components/copy-button'
+import {
+  getUnhandledErrorType,
+  isUnhandledConsoleOrRejection,
+} from '../../../errors/console-error'
+import { extractNextErrorCode } from '../../../../../lib/error-telemetry-utils'
 
 export type SupportedErrorEvent = {
   id: number
@@ -35,11 +46,56 @@ export type ErrorsProps = {
   errors: SupportedErrorEvent[]
   initialDisplayState: DisplayState
   versionInfo?: VersionInfo
+  hasStaticIndicator?: boolean
+  debugInfo?: DebugInfo
 }
 
 type ReadyErrorEvent = ReadyRuntimeError
 
 type DisplayState = 'minimized' | 'fullscreen' | 'hidden'
+
+function isNextjsLink(text: string): boolean {
+  return text.startsWith('https://nextjs.org')
+}
+
+function ErrorDescription({
+  error,
+  hydrationWarning,
+}: {
+  error: Error
+  hydrationWarning: string | null
+}) {
+  const isUnhandledOrReplayError = isUnhandledConsoleOrRejection(error)
+  const unhandledErrorType = isUnhandledOrReplayError
+    ? getUnhandledErrorType(error)
+    : null
+  const isConsoleErrorStringMessage = unhandledErrorType === 'string'
+  // If the error is:
+  // - hydration warning
+  // - captured console error or unhandled rejection
+  // skip displaying the error name
+  const title =
+    (isUnhandledOrReplayError && isConsoleErrorStringMessage) ||
+    hydrationWarning
+      ? ''
+      : error.name + ': '
+
+  // If it's replayed error, display the environment name
+  const environmentName =
+    'environmentName' in error ? error['environmentName'] : ''
+  const envPrefix = environmentName ? `[ ${environmentName} ] ` : ''
+  const isMsgMissingEnvPrefix = !error.message.startsWith(envPrefix)
+  return (
+    <>
+      {isMsgMissingEnvPrefix && envPrefix}
+      {title}
+      <HotlinkedText
+        text={hydrationWarning || error.message}
+        matcher={isNextjsLink}
+      />
+    </>
+  )
+}
 
 function getErrorSignature(ev: SupportedErrorEvent): string {
   const { event } = ev
@@ -62,6 +118,8 @@ export function Errors({
   errors,
   initialDisplayState,
   versionInfo,
+  hasStaticIndicator,
+  debugInfo,
 }: ErrorsProps) {
   const [lookups, setLookups] = useState(
     {} as { [eventId: string]: ReadyErrorEvent }
@@ -105,21 +163,16 @@ export function Errors({
     if (nextError == null) {
       return
     }
-    let mounted = true
 
-    getErrorByType(nextError, isAppDir).then(
-      (resolved) => {
+    let mounted = true
+    getErrorByType(nextError, isAppDir).then((resolved) => {
+      if (mounted) {
         // We don't care if the desired error changed while we were resolving,
         // thus we're not tracking it using a ref. Once the work has been done,
         // we'll store it.
-        if (mounted) {
-          setLookups((m) => ({ ...m, [resolved.id]: resolved }))
-        }
-      },
-      () => {
-        // TODO: handle this, though an edge case
+        setLookups((m) => ({ ...m, [resolved.id]: resolved }))
       }
-    )
+    })
 
     return () => {
       mounted = false
@@ -177,7 +230,12 @@ export function Errors({
 
   if (displayState === 'minimized') {
     return (
-      <Toast className="nextjs-toast-errors-parent" onClick={fullscreen}>
+      <Toast
+        data-nextjs-toast
+        data-issues
+        className={`nextjs-toast-errors-parent${hasStaticIndicator ? ' nextjs-error-with-static' : ''}`}
+        onClick={fullscreen}
+      >
         <div className="nextjs-toast-errors">
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -195,17 +253,18 @@ export function Errors({
             <line x1="12" y1="16" x2="12.01" y2="16"></line>
           </svg>
           <span>
-            {readyErrors.length} error{readyErrors.length > 1 ? 's' : ''}
+            <span data-issues-count>{readyErrors.length}</span> issue
+            {readyErrors.length > 1 ? 's' : ''}
           </span>
           <button
             data-nextjs-toast-errors-hide-button
-            className="nextjs-toast-errors-hide-button"
+            className="nextjs-toast-hide-button"
             type="button"
             onClick={(e) => {
               e.stopPropagation()
               hide()
             }}
-            aria-label="Hide Errors"
+            aria-label="Hide Issues"
           >
             <CloseIcon />
           </button>
@@ -214,9 +273,26 @@ export function Errors({
     )
   }
 
+  const error = activeError.error
   const isServerError = ['server', 'edge-server'].includes(
-    getErrorSource(activeError.error) || ''
+    getErrorSource(error) || ''
   )
+  const isUnhandledError = isUnhandledConsoleOrRejection(error)
+  const errorDetails: HydrationErrorState = (error as any).details || {}
+  const notes = errorDetails.notes || ''
+  const [warningTemplate, serverContent, clientContent] =
+    errorDetails.warning || [null, '', '']
+
+  const hydrationErrorType = getHydrationWarningType(warningTemplate)
+  const hydrationWarning = warningTemplate
+    ? warningTemplate
+        .replace('%s', serverContent)
+        .replace('%s', clientContent)
+        .replace('%s', '') // remove the %s for stack
+        .replace(/%s$/, '') // If there's still a %s at the end, remove it
+        .replace(/^Warning: /, '')
+        .replace(/^Error: /, '')
+    : null
 
   return (
     <Overlay>
@@ -234,19 +310,88 @@ export function Errors({
               close={isServerError ? undefined : minimize}
             >
               <small>
-                <span>{activeIdx + 1}</span> of{' '}
-                <span>{readyErrors.length}</span> unhandled error
+                <span data-nextjs-dialog-error-index={activeIdx}>
+                  {activeIdx + 1}
+                </span>{' '}
+                of{' '}
+                <span data-nextjs-dialog-header-total-count>
+                  {readyErrors.length}
+                </span>
+                {' issue'}
                 {readyErrors.length < 2 ? '' : 's'}
               </small>
-              {versionInfo ? <VersionStalenessInfo {...versionInfo} /> : null}
+              <VersionStalenessInfo versionInfo={versionInfo} />
             </LeftRightDialogHeader>
-            <h1 id="nextjs__container_errors_label">
-              {isServerError ? 'Server Error' : 'Unhandled Runtime Error'}
-            </h1>
-            <p id="nextjs__container_errors_desc">
-              {activeError.error.name}:{' '}
-              <HotlinkedText text={activeError.error.message} />
+
+            <div
+              className="nextjs__container_errors__error_title"
+              data-nextjs-error-code={extractNextErrorCode(error)} // allow assertion in tests before error rating is implemented
+            >
+              <h1
+                id="nextjs__container_errors_label"
+                className="nextjs__container_errors_label"
+              >
+                {isServerError
+                  ? 'Server Error'
+                  : isUnhandledError
+                    ? 'Console Error'
+                    : 'Unhandled Runtime Error'}
+              </h1>
+              <span>
+                <CopyButton
+                  data-nextjs-data-runtime-error-copy-stack
+                  actionLabel="Copy error stack"
+                  successLabel="Copied"
+                  content={error.stack || ''}
+                  disabled={!error.stack}
+                />
+
+                <NodejsInspectorCopyButton
+                  devtoolsFrontendUrl={debugInfo?.devtoolsFrontendUrl}
+                />
+              </span>
+            </div>
+            <p
+              id="nextjs__container_errors_desc"
+              className="nextjs__container_errors_desc"
+            >
+              <ErrorDescription
+                error={error}
+                hydrationWarning={hydrationWarning}
+              />
             </p>
+            {notes ? (
+              <>
+                <p
+                  id="nextjs__container_errors__notes"
+                  className="nextjs__container_errors__notes"
+                >
+                  {notes}
+                </p>
+              </>
+            ) : null}
+            {hydrationWarning ? (
+              <p
+                id="nextjs__container_errors__link"
+                className="nextjs__container_errors__link"
+              >
+                <HotlinkedText text="See more info here: https://nextjs.org/docs/messages/react-hydration-error" />
+              </p>
+            ) : null}
+
+            {hydrationWarning &&
+            (activeError.componentStackFrames?.length ||
+              !!errorDetails.reactOutputComponentDiff) ? (
+              <PseudoHtmlDiff
+                className="nextjs__container_errors__component-stack"
+                hydrationMismatchType={hydrationErrorType}
+                firstContent={serverContent}
+                secondContent={clientContent}
+                reactOutputComponentDiff={
+                  errorDetails.reactOutputComponentDiff || ''
+                }
+              />
+            ) : null}
             {isServerError ? (
               <div>
                 <small>
@@ -256,9 +401,14 @@ export function Errors({
               </div>
             ) : undefined}
           </DialogHeader>
-          <DialogBody className="nextjs-container-errors-body">
-            <RuntimeError key={activeError.id.toString()} error={activeError} />
-          </DialogBody>
+          <Suspense fallback={<div data-nextjs-error-suspended />}>
+            <DialogBody className="nextjs-container-errors-body">
+              <RuntimeError
+                key={activeError.id.toString()}
+                error={activeError}
+              />
+            </DialogBody>
+          </Suspense>
         </DialogContent>
       </Dialog>
     </Overlay>
@@ -266,12 +416,18 @@ export function Errors({
 }
 
 export const styles = css`
+  .nextjs-error-with-static {
+    bottom: calc(var(--size-gap-double) * 4.5);
+  }
+  .nextjs-container-errors-header {
+    position: relative;
+  }
   .nextjs-container-errors-header > h1 {
     font-size: var(--size-font-big);
     line-height: var(--size-font-bigger);
     font-weight: bold;
-    margin: 0;
-    margin-top: calc(var(--size-gap-double) + var(--size-gap-half));
+    margin: calc(var(--size-gap-double) * 1.5) 0;
+    color: var(--color-title-h1);
   }
   .nextjs-container-errors-header small {
     font-size: var(--size-font-small);
@@ -281,32 +437,53 @@ export const styles = css`
   .nextjs-container-errors-header small > span {
     font-family: var(--font-stack-monospace);
   }
-  .nextjs-container-errors-header > p {
-    font-family: var(--font-stack-monospace);
+  .nextjs-container-errors-header p {
     font-size: var(--size-font-small);
     line-height: var(--size-font-big);
-    font-weight: bold;
-    margin: 0;
-    margin-top: var(--size-gap-half);
-    color: var(--color-ansi-red);
     white-space: pre-wrap;
+  }
+  .nextjs__container_errors_desc {
+    font-family: var(--font-stack-monospace);
+    padding: var(--size-gap) var(--size-gap-double);
+    border-left: 2px solid var(--color-text-color-red-1);
+    margin-top: var(--size-gap);
+    font-weight: bold;
+    color: var(--color-text-color-red-1);
+    background-color: var(--color-text-background-red-1);
+  }
+  p.nextjs__container_errors__link {
+    margin: var(--size-gap-double) auto;
+    color: var(--color-text-color-red-1);
+    font-weight: 600;
+    font-size: 15px;
+  }
+  p.nextjs__container_errors__notes {
+    margin: var(--size-gap-double) auto;
+    color: var(--color-stack-notes);
+    font-weight: 600;
+    font-size: 15px;
   }
   .nextjs-container-errors-header > div > small {
     margin: 0;
     margin-top: var(--size-gap-half);
   }
   .nextjs-container-errors-header > p > a {
-    color: var(--color-ansi-red);
+    color: inherit;
+    font-weight: bold;
   }
-
   .nextjs-container-errors-body > h2:not(:first-child) {
     margin-top: calc(var(--size-gap-double) + var(--size-gap));
   }
   .nextjs-container-errors-body > h2 {
+    color: var(--color-title-color);
     margin-bottom: var(--size-gap);
     font-size: var(--size-font-big);
   }
-
+  .nextjs__container_errors__component-stack {
+    padding: 12px 32px;
+    color: var(--color-ansi-fg);
+    background: var(--color-ansi-bg);
+  }
   .nextjs-toast-errors-parent {
     cursor: pointer;
     transition: transform 0.2s ease;
@@ -322,7 +499,7 @@ export const styles = css`
   .nextjs-toast-errors > svg {
     margin-right: var(--size-gap);
   }
-  .nextjs-toast-errors-hide-button {
+  .nextjs-toast-hide-button {
     margin-left: var(--size-gap-triple);
     border: none;
     background: none;
@@ -331,7 +508,34 @@ export const styles = css`
     transition: opacity 0.25s ease;
     opacity: 0.7;
   }
-  .nextjs-toast-errors-hide-button:hover {
+  .nextjs-toast-hide-button:hover {
     opacity: 1;
+  }
+  .nextjs-container-errors-header
+    > .nextjs-container-build-error-version-status {
+    position: absolute;
+    top: 0;
+    right: 0;
+  }
+  .nextjs__container_errors_inspect_copy_button {
+    cursor: pointer;
+    background: none;
+    border: none;
+    color: var(--color-ansi-bright-white);
+    font-size: 1.5rem;
+    padding: 0;
+    margin: 0;
+    margin-left: var(--size-gap);
+    transition: opacity 0.25s ease;
+  }
+  .nextjs__container_errors__error_title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .nextjs-data-runtime-error-inspect-link,
+  .nextjs-data-runtime-error-inspect-link:hover {
+    margin: 0 8px;
+    color: inherit;
   }
 `

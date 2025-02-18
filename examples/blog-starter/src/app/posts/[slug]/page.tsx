@@ -1,15 +1,16 @@
 import { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { getAllPosts, getPostBySlug } from "../../../lib/api";
-import { CMS_NAME } from "../../../lib/constants";
-import markdownToHtml from "../../../lib/markdownToHtml";
-import Alert from "../../_components/alert";
-import Container from "../../_components/container";
-import Header from "../../_components/header";
-import { PostBody } from "../../_components/post-body";
-import { PostHeader } from "../../_components/post-header";
+import { getAllPosts, getPostBySlug } from "@/lib/api";
+import { CMS_NAME } from "@/lib/constants";
+import markdownToHtml from "@/lib/markdownToHtml";
+import Alert from "@/app/_components/alert";
+import Container from "@/app/_components/container";
+import Header from "@/app/_components/header";
+import { PostBody } from "@/app/_components/post-body";
+import { PostHeader } from "@/app/_components/post-header";
 
-export default async function Post({ params }: Params) {
+export default async function Post(props: Params) {
+  const params = await props.params;
   const post = getPostBySlug(params.slug);
 
   if (!post) {
@@ -38,12 +39,13 @@ export default async function Post({ params }: Params) {
 }
 
 type Params = {
-  params: {
+  params: Promise<{
     slug: string;
-  };
+  }>;
 };
 
-export function generateMetadata({ params }: Params): Metadata {
+export async function generateMetadata(props: Params): Promise<Metadata> {
+  const params = await props.params;
   const post = getPostBySlug(params.slug);
 
   if (!post) {
@@ -53,6 +55,7 @@ export function generateMetadata({ params }: Params): Metadata {
   const title = `${post.title} | Next.js Blog Example with ${CMS_NAME}`;
 
   return {
+    title,
     openGraph: {
       title,
       images: [post.ogImage.url],

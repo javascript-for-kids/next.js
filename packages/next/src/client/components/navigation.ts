@@ -1,5 +1,7 @@
-import { useContext, useMemo } from 'react'
 import type { FlightRouterState } from '../../server/app-render/types'
+import type { Params } from '../../server/request/params'
+
+import { useContext, useMemo } from 'react'
 import {
   AppRouterContext,
   LayoutRouterContext,
@@ -10,37 +12,10 @@ import {
   PathnameContext,
   PathParamsContext,
 } from '../../shared/lib/hooks-client-context.shared-runtime'
-import { clientHookInServerComponentError } from './client-hook-in-server-component-error'
 import { getSegmentValue } from './router-reducer/reducers/get-segment-value'
 import { PAGE_SEGMENT_KEY, DEFAULT_SEGMENT_KEY } from '../../shared/lib/segment'
-
-/** @internal */
-class ReadonlyURLSearchParamsError extends Error {
-  constructor() {
-    super(
-      'Method unavailable on `ReadonlyURLSearchParams`. Read more: https://nextjs.org/docs/app/api-reference/functions/use-search-params#updating-searchparams'
-    )
-  }
-}
-
-export class ReadonlyURLSearchParams extends URLSearchParams {
-  /** @deprecated Method unavailable on `ReadonlyURLSearchParams`. Read more: https://nextjs.org/docs/app/api-reference/functions/use-search-params#updating-searchparams */
-  append() {
-    throw new ReadonlyURLSearchParamsError()
-  }
-  /** @deprecated Method unavailable on `ReadonlyURLSearchParams`. Read more: https://nextjs.org/docs/app/api-reference/functions/use-search-params#updating-searchparams */
-  delete() {
-    throw new ReadonlyURLSearchParamsError()
-  }
-  /** @deprecated Method unavailable on `ReadonlyURLSearchParams`. Read more: https://nextjs.org/docs/app/api-reference/functions/use-search-params#updating-searchparams */
-  set() {
-    throw new ReadonlyURLSearchParamsError()
-  }
-  /** @deprecated Method unavailable on `ReadonlyURLSearchParams`. Read more: https://nextjs.org/docs/app/api-reference/functions/use-search-params#updating-searchparams */
-  sort() {
-    throw new ReadonlyURLSearchParamsError()
-  }
-}
+import { ReadonlyURLSearchParams } from './navigation.react-server'
+import { useDynamicRouteParams } from '../../server/app-render/dynamic-rendering'
 
 /**
  * A [Client Component](https://nextjs.org/docs/app/building-your-application/rendering/client-components) hook
@@ -62,8 +37,8 @@ export class ReadonlyURLSearchParams extends URLSearchParams {
  *
  * Read more: [Next.js Docs: `useSearchParams`](https://nextjs.org/docs/app/api-reference/functions/use-search-params)
  */
+// Client components API
 export function useSearchParams(): ReadonlyURLSearchParams {
-  clientHookInServerComponentError('useSearchParams')
   const searchParams = useContext(SearchParamsContext)
 
   // In the case where this is `null`, the compat types added in
@@ -107,13 +82,16 @@ export function useSearchParams(): ReadonlyURLSearchParams {
  *
  * Read more: [Next.js Docs: `usePathname`](https://nextjs.org/docs/app/api-reference/functions/use-pathname)
  */
+// Client components API
 export function usePathname(): string {
-  clientHookInServerComponentError('usePathname')
+  useDynamicRouteParams('usePathname()')
+
   // In the case where this is `null`, the compat types added in `next-env.d.ts`
   // will add a new overload that changes the return type to include `null`.
   return useContext(PathnameContext) as string
 }
 
+// Client components API
 export {
   ServerInsertedHTMLContext,
   useServerInsertedHTML,
@@ -137,18 +115,14 @@ export {
  *
  * Read more: [Next.js Docs: `useRouter`](https://nextjs.org/docs/app/api-reference/functions/use-router)
  */
+// Client components API
 export function useRouter(): AppRouterInstance {
-  clientHookInServerComponentError('useRouter')
   const router = useContext(AppRouterContext)
   if (router === null) {
     throw new Error('invariant expected app router to be mounted')
   }
 
   return router
-}
-
-interface Params {
-  [key: string]: string | string[]
 }
 
 /**
@@ -168,13 +142,15 @@ interface Params {
  *
  * Read more: [Next.js Docs: `useParams`](https://nextjs.org/docs/app/api-reference/functions/use-params)
  */
+// Client components API
 export function useParams<T extends Params = Params>(): T {
-  clientHookInServerComponentError('useParams')
+  useDynamicRouteParams('useParams()')
 
   return useContext(PathParamsContext) as T
 }
 
 /** Get the canonical parameters from the current level to the leaf node. */
+// Client components API
 function getSelectedLayoutSegmentPath(
   tree: FlightRouterState,
   parallelRouteKey: string,
@@ -194,7 +170,8 @@ function getSelectedLayoutSegmentPath(
   if (!node) return segmentPath
   const segment = node[0]
 
-  const segmentValue = getSegmentValue(segment)
+  let segmentValue = getSegmentValue(segment)
+
   if (!segmentValue || segmentValue.startsWith(PAGE_SEGMENT_KEY)) {
     return segmentPath
   }
@@ -234,12 +211,17 @@ function getSelectedLayoutSegmentPath(
  *
  * Read more: [Next.js Docs: `useSelectedLayoutSegments`](https://nextjs.org/docs/app/api-reference/functions/use-selected-layout-segments)
  */
+// Client components API
 export function useSelectedLayoutSegments(
   parallelRouteKey: string = 'children'
 ): string[] {
-  clientHookInServerComponentError('useSelectedLayoutSegments')
-  const { tree } = useContext(LayoutRouterContext)
-  return getSelectedLayoutSegmentPath(tree, parallelRouteKey)
+  useDynamicRouteParams('useSelectedLayoutSegments()')
+
+  const context = useContext(LayoutRouterContext)
+  // @ts-expect-error This only happens in `pages`. Type is overwritten in navigation.d.ts
+  if (!context) return null
+
+  return getSelectedLayoutSegmentPath(context.parentTree, parallelRouteKey)
 }
 
 /**
@@ -260,12 +242,15 @@ export function useSelectedLayoutSegments(
  *
  * Read more: [Next.js Docs: `useSelectedLayoutSegment`](https://nextjs.org/docs/app/api-reference/functions/use-selected-layout-segment)
  */
+// Client components API
 export function useSelectedLayoutSegment(
   parallelRouteKey: string = 'children'
 ): string | null {
-  clientHookInServerComponentError('useSelectedLayoutSegment')
+  useDynamicRouteParams('useSelectedLayoutSegment()')
+
   const selectedLayoutSegments = useSelectedLayoutSegments(parallelRouteKey)
-  if (selectedLayoutSegments.length === 0) {
+
+  if (!selectedLayoutSegments || selectedLayoutSegments.length === 0) {
     return null
   }
 
@@ -281,5 +266,14 @@ export function useSelectedLayoutSegment(
     : selectedLayoutSegment
 }
 
-export { redirect, permanentRedirect, RedirectType } from './redirect'
-export { notFound } from './not-found'
+// Shared components APIs
+export {
+  notFound,
+  forbidden,
+  unauthorized,
+  redirect,
+  permanentRedirect,
+  RedirectType,
+  ReadonlyURLSearchParams,
+  unstable_rethrow,
+} from './navigation.react-server'
